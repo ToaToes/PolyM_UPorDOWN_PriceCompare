@@ -7,8 +7,8 @@ To get UP and DOWN percentage, which just represents the price to bid in cents
 
 To get Time left in 5min, or 15min, or 1Day
 
-Price to beat is estimated from BTC current price with UP and DOWN percentage before 30 secs<br>
-since its not possible to get Price to Beat directly from Poly which API not allowed
+Using last s 0:00 price as the price for next 5 min price to beat, error is controlled within 0.0026%, pretty accurate
+cant make 100% accurate due to latency and time adjustment, or just tje distance from the server
 
 # fallback.py
 

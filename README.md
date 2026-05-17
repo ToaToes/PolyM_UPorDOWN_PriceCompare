@@ -1,6 +1,6 @@
 # Polymarket BTC 5-Minute Window Tracker
 
-实时监控 Polymarket BTC 5分钟涨跌窗口的价格和概率。
+实时监控 Polymarket BTC 5分钟涨跌窗口的价格和概率。或者任意15min， Daily时间段
 
 ## 系统要求
 

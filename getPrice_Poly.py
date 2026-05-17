@@ -1,3 +1,19 @@
+'''
+
+Author: ToaToes - https://github.com/ToaToes
+Description:
+    This script connects to Polymarket's WebSocket for real-time BTC price updates,
+    fetches the current "price to beat" for the active 5-minute BTC event, and displays
+    a live dashboard in the terminal showing the current price, price to beat, and time remaining
+    in the current window. It automatically detects new windows and updates accordingly.
+
+    Time zone is set to Eastern Time (ET) for display as its what Polymarket's frontend uses.
+    
+    There might be a 0.002% error in the price to beat due to how Polymarket calculates it internally, 
+    but it should be close enough for comparison purposes.
+
+'''
+
 import re, json, requests, time, threading
 from datetime import datetime
 from zoneinfo import ZoneInfo

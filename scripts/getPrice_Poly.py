@@ -8,9 +8,11 @@ Description:
     in the current window. It automatically detects new windows and updates accordingly.
 
     Time zone is set to Eastern Time (ET) for display as its what Polymarket's frontend uses.
-    
-    There might be a 0.002% error in the price to beat due to how Polymarket calculates it internally, 
-    but it should be close enough for comparison purposes.
+
+    Startup behavior:
+    - Waits for the next 5-minute window boundary before starting display
+    - Uses a dedicated snapshot thread to capture PTB at the exact window close moment
+    - Absolute-time tick alignment (no second-skipping)
 
 '''
 
@@ -24,12 +26,15 @@ WINDOW_SECS = 300
 UTC = ZoneInfo("UTC")
 ET  = ZoneInfo("America/New_York")
 
-btc_live      = None
-price_to_beat = None
-price_lock    = threading.Lock()
-ws_connected  = False
-ptb_message   = None
+# ── 全局状态 ──────────────────────────────────────────────────────────
+btc_live         = None
+price_to_beat    = None
+ptb_message      = None
+window_end_price = None
+price_lock       = threading.Lock()
+ws_connected     = False
 
+# ── 工具函数 ──────────────────────────────────────────────────────────
 def slug_from_url(url_or_slug: str) -> str:
     s = url_or_slug.strip()
     match = re.search(r'polymarket\.com/event/([^/?#]+)', s)
@@ -55,7 +60,7 @@ def parse_tokens(market: dict):
     tid_up = tid_dn = None
     for name, tid in zip(outcomes, token_ids):
         if   name.strip().lower() == "up":   tid_up = tid
-        elif name.strip().lower() == "down":  tid_dn = tid
+        elif name.strip().lower() == "down": tid_dn = tid
     return tid_up, tid_dn
 
 def get_clob_midprice(token_id: str) -> float | None:
@@ -68,18 +73,38 @@ def get_clob_midprice(token_id: str) -> float | None:
     except:
         return None
 
-# ── RTDS WebSocket ────────────────────────────────────────────────────
+# ── 精确收盘采样线程 ──────────────────────────────────────────────────
+def schedule_closing_snapshot(target_ts: float):
+    """
+    在 target_ts（窗口结束的 Unix 时间戳）精确采样 btc_live，
+    写入 price_to_beat 作为下一个窗口的 PTB。
+    误差 < 10ms，不依赖主循环节奏。
+    """
+    def _snap():
+        global window_end_price, price_to_beat, ptb_message
+
+        wait = target_ts - time.time()
+        if wait > 0:
+            time.sleep(wait)
+
+        with price_lock:
+            if btc_live is not None:
+                window_end_price = btc_live
+                price_to_beat    = btc_live
+                ptb_message      = (f"★ Price to Beat (window close snapshot): "
+                                    f"${btc_live:,.2f}")
+                print(f"\n\n  📌 Closing snapshot @ "
+                      f"{datetime.now(ET).strftime('%H:%M:%S %Z')}: "
+                      f"${btc_live:,.2f}  ← next window PTB\n")
+
+    threading.Thread(target=_snap, daemon=True).start()
+
+# ── WebSocket ─────────────────────────────────────────────────────────
 def start_rtds_ws():
     global btc_live, ws_connected
 
-    sub = json.dumps({
-        "action": "subscribe",
-        "subscriptions": [{
-            "topic":   "crypto_prices_chainlink",
-            "type":    "*",
-            "filters": ""
-        }]
-    })
+    sub  = json.dumps({"action": "subscribe", "subscriptions": [{
+               "topic": "crypto_prices_chainlink", "type": "*", "filters": ""}]})
     ping = json.dumps({"type": "PING"})
 
     def on_open(ws):
@@ -107,7 +132,6 @@ def start_rtds_ws():
             val = float(payload.get("value", 0) or 0)
             if val < 1000:
                 return
-
             with price_lock:
                 btc_live = val
         except:
@@ -125,9 +149,27 @@ def start_rtds_ws():
                      kwargs={"ping_interval": 0}, daemon=True).start()
     return ws
 
-# ── Market setup ──────────────────────────────────────────────────────
+# ── 启动 ──────────────────────────────────────────────────────────────
 url_input = input("Enter Polymarket URL or slug (Enter = current window): ").strip()
 
+print("  Connecting to Chainlink WebSocket...")
+ws_conn = start_rtds_ws()
+time.sleep(4)   # 等待 WS 连接稳定
+
+# ── 等到下一个整窗口边界再开始（确保从 5m 00s 显示）────────────────
+now            = time.time()
+next_window_ts = int(now - (now % WINDOW_SECS)) + WINDOW_SECS
+wait_secs      = next_window_ts - time.time()
+
+if wait_secs > 1:
+    print(f"  ⏳ Waiting {wait_secs:.1f}s for next window boundary "
+          f"({datetime.fromtimestamp(next_window_ts, tz=UTC).astimezone(ET).strftime('%H:%M:%S %Z')})...")
+    # 等待期间同时注册收盘采样：next_window_ts 就是当前窗口的结束时刻
+    # _snap 会在整点边界采样，作为新窗口的 PTB
+    schedule_closing_snapshot(next_window_ts)
+    time.sleep(wait_secs)
+
+# 等完之后重新获取当前窗口（现在已经是新窗口了）
 if url_input:
     slug = slug_from_url(url_input)
     m_ts = re.search(r'btc-updown-5m-(\d+)', slug)
@@ -135,10 +177,6 @@ if url_input:
     window_end_ts   = window_start_ts + WINDOW_SECS
 else:
     slug, window_start_ts, window_end_ts = current_window_slug()
-
-# 获取第一个窗口的ptb需要从Chainlink历史获取，后续窗口会用前一个窗口的收盘价
-# 对于第一个窗口，尝试从WebSocket获取第一个tick作为ptb
-first_window = True
 
 market = get_market(slug)
 title  = market.get("question") or market.get("title") or slug
@@ -152,73 +190,73 @@ print(f"  {title}")
 print(f"  Window: {open_et.strftime('%Y-%m-%d %H:%M:%S %Z')} → {close_et.strftime('%H:%M:%S %Z')}")
 print(f"{'='*75}")
 
-print("  Connecting to Chainlink WebSocket...")
-ws_conn = start_rtds_ws()
-time.sleep(4)
+# 打印启动时已采样好的 PTB
+with price_lock:
+    ptb_now = price_to_beat
+if ptb_now:
+    print(f"\n  {ptb_message}\n")
+else:
+    print("  ⚠  PTB snapshot not ready, will use first WS tick as fallback\n")
 
-# 表头
+# 注册本窗口的收盘采样线程
+schedule_closing_snapshot(window_end_ts)
+
+# ── 表头 ──────────────────────────────────────────────────────────────
 HDR = (f"{'Time (ET)':<22} {'BTC (Chainlink)':>16} {'Price to Beat':>14} "
        f"{'Δ':>9} {'UP%':>8} {'DOWN%':>8} {'Time Left':>12}")
 SEP = "-" * len(HDR)
+print(HDR)
+print(SEP)
 
 last_up = last_dn = None
-tick = 0
-window_end_price = None  # 保存当前窗口结束时的价格
+tick    = 0
 
+# ── 主循环 ────────────────────────────────────────────────────────────
 try:
     while True:
         now       = int(time.time())
         remaining = max(0, window_end_ts - now)
-        
-        # 检查窗口是否即将结束，保存窗口结束时的价格
+
+        # ── 窗口切换 ──────────────────────────────────────────────────
         if remaining == 0:
-            # 保存当前窗口的最终价格作为下一个窗口的ptb
-            with price_lock:
-                if btc_live:
-                    window_end_price = btc_live
-                    print(f"\n  📌 Window closed. Final price: ${window_end_price:,.2f} (will be next window's Price to Beat)")
-            
+            # _snap 线程已在精确时刻写好 price_to_beat，这里只切换元数据
             print("\n  ⏱  Window closed — advancing to next window...")
-            time.sleep(3)
-            
-            # 切换到下一个窗口
+            time.sleep(0.2)  # 给 _snap 线程足够时间完成写入
+
             slug, window_start_ts, window_end_ts = current_window_slug()
             market  = get_market(slug)
             title   = market.get("question") or market.get("title") or slug
             tid_up, tid_dn = parse_tokens(market)
             last_up = last_dn = None
-            
-            # 将上一个窗口的收盘价设置为新窗口的ptb
+
             with price_lock:
-                if window_end_price:
-                    price_to_beat = window_end_price
-                    ptb_message = f"★ Price to Beat (from previous window close): ${price_to_beat:,.2f}"
-                    print(f"\n{ptb_message}")
-                    window_end_price = None  # 重置
-                else:
-                    price_to_beat = None
-                    ptb_message = None
-            
+                ptb_now = price_to_beat
+            if ptb_now:
+                print(f"\n  {ptb_message}")
+            else:
+                print("\n  ⚠  PTB not yet available (snapshot may have missed a tick)")
+
             open_et  = datetime.fromtimestamp(window_start_ts, tz=UTC).astimezone(ET)
             close_et = datetime.fromtimestamp(window_end_ts,   tz=UTC).astimezone(ET)
             print(f"\n  New window: {title}")
             print(f"  {open_et.strftime('%Y-%m-%d %H:%M:%S %Z')} → {close_et.strftime('%H:%M:%S %Z')}")
             print(f"\n{HDR}")
             print(f"{SEP}")
-            time.sleep(3)
+
+            # 注册新窗口收盘采样线程
+            schedule_closing_snapshot(window_end_ts)
             continue
-        
-        # 对于第一个窗口，如果没有ptb，尝试从WebSocket获取第一个tick作为ptb
-        if first_window and price_to_beat is None:
+
+        # ── fallback：PTB 仍为空时用当前 tick ────────────────────────
+        if price_to_beat is None:
             with price_lock:
-                if btc_live:
+                if btc_live is not None:
                     price_to_beat = btc_live
-                    ptb_message = f"★ Price to Beat (first Chainlink tick of window): ${price_to_beat:,.2f}"
-                    print(f"\n{ptb_message}\n")
-                    print(f"{HDR}")
-                    print(f"{SEP}")
-                    first_window = False
-        
+                    ptb_message   = (f"★ Price to Beat (fallback first tick): "
+                                     f"${price_to_beat:,.2f}")
+                    print(f"\n  {ptb_message}\n")
+
+        # ── CLOB 中间价（每 2 tick 更新一次）────────────────────────
         tick += 1
         if tick % 2 == 0 or last_up is None:
             up_mid = get_clob_midprice(tid_up)
@@ -234,21 +272,24 @@ try:
         mins, scs = divmod(remaining, 60)
         time_left = f"{mins}m {scs:02d}s"
         live_str  = f"${live:>14,.2f}" if live else "             N/A"
-        
-        # 显示ptb
+
         if ptb:
-            ptb_str = f"${ptb:>12,.2f}"
-            delta_str = f"{'UP' if (live - ptb) >= 0 else 'DOWN'}${abs(live - ptb):>7,.2f}" if live else ""
+            ptb_str   = f"${ptb:>12,.2f}"
+            delta_str = (f"{'UP' if (live - ptb) >= 0 else 'DOWN'}"
+                         f"${abs(live - ptb):>7,.2f}") if live else ""
         else:
-            ptb_str = "      pending..."
+            ptb_str   = "      pending..."
             delta_str = ""
-        
+
         up_str = f"{last_up:>7.2f}%" if last_up is not None else "     N/A"
         dn_str = f"{last_dn:>7.2f}%" if last_dn is not None else "     N/A"
 
         print(f"{dt_str}  {live_str}  {ptb_str}  {delta_str:>11}  {up_str}  {dn_str}  {time_left:>10}")
-        
-        time.sleep(1)
+
+        # ── 绝对时间对齐：sleep 到下一个整秒 ─────────────────────────
+        now_f     = time.time()
+        next_tick = int(now_f) + 1
+        time.sleep(next_tick - now_f)
 
 except KeyboardInterrupt:
     print("\nStopped.")
